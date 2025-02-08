@@ -6,8 +6,8 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
+// #include <OneWire.h>
+// #include <DallasTemperature.h>
 #include <RTClib.h>
 #include "DFRobot_GDL.h"
 
@@ -28,8 +28,8 @@ Adafruit_LTR390 ltr = Adafruit_LTR390();
 #define TFT_RST 14
 DFRobot_ST7735_128x160_HW_SPI screen(/*dc=*/TFT_DC, /*cs=*/TFT_CS, /*rst=*/TFT_RST);
 
-OneWire oneWire(DS18B20PIN);
-DallasTemperature ds18b20_sensor(&oneWire);
+// OneWire oneWire(DS18B20PIN);
+// DallasTemperature ds18b20_sensor(&oneWire);
 
 float tdsValue = 0;
 float ecValue = 0;
@@ -61,7 +61,7 @@ const unsigned long NUTRIENT_DISPENSE_DURATION_SEC = 14;
 const unsigned long COOLDOWN_PERIOD_SEC = 300;
 
 // TDS thresholds (adjust as needed)
-const float TDS_LOW_LIMIT = 700.0;   // Below this, dosing is needed.
+const float TDS_LOW_LIMIT = 700.0;    // Below this, dosing is needed.
 const float TDS_HIGH_LIMIT = 1000.0;  // At or above this, dosing is not allowed.
 
 // Global variables for dosing control:
@@ -77,7 +77,7 @@ DateTime lastDataSentTime;
 
 const char* mqtt_broker = "rff61f13.ala.asia-southeast1.emqxsl.com";
 const char* topic = "test/test";
-const char* command_topic = "devices/esp32-1/command";
+const char* command_topic = "devices/test/command";
 const char* mqtt_username = "test";
 const char* mqtt_password = "hydrobud12345";
 const int mqtt_port = 8883;
@@ -143,7 +143,10 @@ std::pair<float, float> calculateECTDS(int pin, float aref, float dynamicTemp, i
 
     // Temperature compensation
     float compensationCoefficient = 1.0 + 0.02 * (temperature - 25.0);
-    float compensationVoltage = averageVoltage / compensationCoefficient;
+    // float compensationVoltage = averageVoltage / compensationCoefficient;
+    float compensationVoltage = averageVoltage;
+    // Serial.printf("Avg V: %.2f, Comp Coeff: %.2f, Comp V: %.2f", averageVoltage, compensationCoefficient, compensationVoltage);
+    // Serial.println();
     if (temperature <= 0) {
       compensationCoefficient = 1.0;  // Avoid unrealistic adjustments for negative temperatures
     }
@@ -297,53 +300,53 @@ void readSensors() {
   long elapsedSeconds = currentTime.unixtime() - dataLastCollectedTime.unixtime();  // Seconds elapsed
 
   // if (elapsedSeconds >= DATA_COLLECT_INTERVAL) {
-    sensors_event_t humidity, temp;
-    aht.getEvent(&humidity, &temp);
+  sensors_event_t humidity, temp;
+  aht.getEvent(&humidity, &temp);
 
-    for (int i = 0; i < 10; i++) {  // Get 10 sample values from the sensor for smoothing
-      buf[i] = analogRead(PHPIN);
-      delay(10);
-    }
-    for (int i = 0; i < 9; i++) {  // Sort the analog values from small to large
-      for (int j = i + 1; j < 10; j++) {
-        if (buf[i] > buf[j]) {
-          tempBuf = buf[i];
-          buf[i] = buf[j];
-          buf[j] = tempBuf;
-        }
+  for (int i = 0; i < 10; i++) {  // Get 10 sample values from the sensor for smoothing
+    buf[i] = analogRead(PHPIN);
+    delay(10);
+  }
+  for (int i = 0; i < 9; i++) {  // Sort the analog values from small to large
+    for (int j = i + 1; j < 10; j++) {
+      if (buf[i] > buf[j]) {
+        tempBuf = buf[i];
+        buf[i] = buf[j];
+        buf[j] = tempBuf;
       }
     }
-    avgValue = 0;
-    for (int i = 2; i < 8; i++) {  // Take the average value of 6 center samples
-      avgValue += buf[i];
-    }
-    pHValue = (((float)avgValue * 3.3) / 4095) - 1.51;
+  }
+  avgValue = 0;
+  for (int i = 2; i < 8; i++) {  // Take the average value of 6 center samples
+    avgValue += buf[i];
+  }
+  pHValue = (((float)avgValue * 3.3) / 4095) - 1.51;
 
 
-    ltr.setMode(LTR390_MODE_ALS);
-    alsRaw = ltr.readALS();
-    delay(100);
-    ltr.setMode(LTR390_MODE_UVS);
-    uvsRaw = ltr.readUVS();
+  ltr.setMode(LTR390_MODE_ALS);
+  alsRaw = ltr.readALS();
+  delay(100);
+  ltr.setMode(LTR390_MODE_UVS);
+  uvsRaw = ltr.readUVS();
 
-    alsLux = alsToLux(alsRaw);
-    uvIndex = uvsToUvIndex(uvsRaw);
+  alsLux = alsToLux(alsRaw);
+  uvIndex = uvsToUvIndex(uvsRaw);
 
-    temperature = temp.temperature;
-    hum = humidity.relative_humidity;
+  temperature = temp.temperature;
+  hum = humidity.relative_humidity;
 
-    ds18b20_sensor.requestTemperatures();
-    water_temp = ds18b20_sensor.getTempCByIndex(0);
-    if (water_temp == DEVICE_DISCONNECTED_C) {
-      // Serial.println("Error: DS18B20 Disconnected!");
-      water_temp = 0;
-    }
+  // ds18b20_sensor.requestTemperatures();
+  // water_temp = ds18b20_sensor.getTempCByIndex(0);
+  // if (water_temp == DEVICE_DISCONNECTED_C) {
+  // Serial.println("Error: DS18B20 Disconnected!");
+  // water_temp = 0;
+  // }
 
-    auto [ec, tds] = calculateECTDS(TDSPIN, 5.0, temperature, ec_tds_buffer, 10);
-    tdsValue = tds;
-    ecValue = ec;
+  auto [ec, tds] = calculateECTDS(TDSPIN, 5.0, temperature, ec_tds_buffer, 10);
+  tdsValue = tds;
+  ecValue = ec;
 
-    Serial.printf("Temperature: %.2f, Humidity: %.2f, ALS: %.1f, UVS: %.2f, ALSRaw: %.1f, UVSRaw: %.2f, PH: %.2f, TDS: %.2f, EC: %.2f, Water Temp: %.2f\n", temperature, hum, alsLux, uvIndex, alsRaw, uvsRaw, pHValue, tdsValue, ecValue, water_temp);
+  Serial.printf("Temperature: %.2f, Humidity: %.2f, ALS: %.1f, UVS: %.2f, ALSRaw: %.1f, UVSRaw: %.2f, PH: %.2f, TDS: %.2f, EC: %.2f, Water Temp: %.2f\n", temperature, hum, alsLux, uvIndex, alsRaw, uvsRaw, pHValue, tdsValue, ecValue, water_temp);
   // }
 }
 
@@ -415,16 +418,95 @@ void setupWifi() {
 }
 
 void handleMqttCallback(char* topic, byte* message, unsigned int length) {
-  char msgBuffer[length + 1];
-  memcpy(msgBuffer, message, length);
-  msgBuffer[length] = '\0';
-  Serial.printf("Message arrived on topic %s: %s\n", topic, msgBuffer);
+  // Convert the incoming message to a String for easy parsing.
+  String msg;
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)message[i];
+  }
+  Serial.printf("Message arrived on topic %s: %s\n", topic, msg.c_str());
 
-  // StaticJsonDocument<256> doc;
-  // deserializeJson(doc, msgBuffer);
-  // if (doc["pump"] == "on") digitalWrite(led, HIGH);
-  // if (doc["pump"] == "off") digitalWrite(led, LOW);
+  // Parse the JSON message.
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, msg);
+  if (error) {
+    Serial.println("Failed to parse JSON command");
+    return;
+  }
+
+  // Read the command from the JSON. (Assuming the key is "command")
+  const char* command = doc["command"];
+  if (command == nullptr) {
+    Serial.println("No command received");
+    return;
+  }
+
+  // Process the command.
+  if (strcmp(command, "nutrient_on") == 0) {
+    // Turn ON nutrient pumps.
+    digitalWrite(NUTRIENT_PUMP1_PIN, LOW);  // LOW turns pump ON
+    digitalWrite(NUTRIENT_PUMP2_PIN, LOW);
+    nutrientDispenseInProgress = false;  // Reset any dosing state.
+    nutrientDosingDone = false;
+    sendPumpData("Nutrient", true);
+    Serial.println("Command: Nutrient Pumps ON");
+  }
+  if (strcmp(command, "nutrient_off") == 0) {
+    // Turn OFF nutrient pumps.
+    digitalWrite(NUTRIENT_PUMP1_PIN, HIGH);  // HIGH turns pump OFF
+    digitalWrite(NUTRIENT_PUMP2_PIN, HIGH);
+    nutrientDispenseInProgress = false;
+    nutrientDosingDone = true;
+    sendPumpData("Nutrient", false);
+    Serial.println("Command: Nutrient Pumps OFF");
+  }
+  if (strcmp(command, "water_on") == 0) {
+    // Turn ON water pump.
+    digitalWrite(WATER_PUMP_PIN, HIGH);  // HIGH turns water pump ON
+    pumpState = true;
+    lastToggleTime = rtc.now();
+    sendPumpData("Water", true);
+    Serial.println("Command: Water Pump ON");
+  }
+  if (strcmp(command, "water_off") == 0) {
+    // Turn OFF water pump.
+    digitalWrite(WATER_PUMP_PIN, LOW);  // LOW turns water pump OFF
+    pumpState = false;
+    lastToggleTime = rtc.now();
+    sendPumpData("Water", false);
+    Serial.println("Command: Water Pump OFF");
+  }
+  if (strcmp(command, "emergency_off") == 0) {
+    // Master failsafe: Turn OFF both nutrient and water pumps.
+    digitalWrite(WATER_PUMP_PIN, LOW);  // Shut off water pump.
+    pumpState = false;
+    digitalWrite(NUTRIENT_PUMP1_PIN, HIGH);  // Shut off nutrient pumps.
+    digitalWrite(NUTRIENT_PUMP2_PIN, HIGH);
+    nutrientDispenseInProgress = false;
+    nutrientDosingDone = true;
+    lastToggleTime = rtc.now();
+    lastDosingEndTime = rtc.now();
+    sendPumpData("Water", false);
+    sendPumpData("Nutrient", false);
+    Serial.println("Command: Emergency OFF - All pumps shut down");
+  }
+  // if (strcmp(command, "request_status") == 0) {
+  //   // Build a status response containing both pump statuses.
+  //   StaticJsonDocument<256> statusDoc;
+  //   statusDoc["userEmail"] = "vsk102002@gmail.com";
+  //   statusDoc["deviceId"] = "test";
+  //   statusDoc["type"] = "status-response";
+  //   // Water pump status: use the pumpState variable.
+  //   statusDoc["waterPumpStatus"] = pumpState;
+  //   // Nutrient pump status: use the global nutrientPumpState variable.
+  //   statusDoc["nutrientPumpStatus"] = nutrientDispenseInProgress;
+
+  //   char statusBuffer[256];
+  //   serializeJson(statusDoc, statusBuffer);
+  //   client.publish(topic, statusBuffer);
+  //   Serial.println("Command: Status requested. Status response sent.");
+  // }
 }
+
 
 void setupDisplay() {
   screen.begin();
