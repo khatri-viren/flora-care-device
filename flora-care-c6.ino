@@ -43,7 +43,7 @@ float alsRaw = 0, uvsRaw = 0;
 
 // Timer durations in minutes
 const int ON_DURATION = 10;   // Duration the pump stays ON
-const int OFF_DURATION = 40;  // Duration the pump stays OFF
+const int OFF_DURATION = 20;  // Duration the pump stays OFF
 
 // Variables to track timing
 RTC_DS3231 rtc;
