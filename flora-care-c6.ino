@@ -6,82 +6,72 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-// #include <OneWire.h>
-// #include <DallasTemperature.h>
 #include <RTClib.h>
 #include "DFRobot_GDL.h"
 
-Adafruit_AHTX0 aht;
-Adafruit_LTR390 ltr = Adafruit_LTR390();
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
+// ——— Pin / peripheral defines ———
+#define SDA_PIN 19  // <— change to your SDA wiring
+#define SCL_PIN 20  // <— change to your SCL wiring
 #define PHPIN 6
 #define TDSPIN 2
-#define led 15
-#define DS18B20PIN 3
+#define LED_PIN 15
 #define WATER_PUMP_PIN 9
 #define WATER_PUMP_BTN 7
 #define NUTRIENT_PUMP1_PIN 4
 #define NUTRIENT_PUMP2_PIN 5
-
 #define TFT_DC 8
 #define TFT_CS 1
 #define TFT_RST 14
-DFRobot_ST7735_128x160_HW_SPI screen(/*dc=*/TFT_DC, /*cs=*/TFT_CS, /*rst=*/TFT_RST);
 
-// OneWire oneWire(DS18B20PIN);
-// DallasTemperature ds18b20_sensor(&oneWire);
-
-float tdsValue = 0;
-float ecValue = 0;
-float pHValue = 0;
-unsigned long int avgValue;  //Store the average value of the sensor feedback
-float b;
-int buf[10], tempBuf;
-int ec_tds_buffer[10] = { 0 };
-float temperature = 0, hum = 0, water_temp = 0, alsLux = 0, uvIndex = 0;
-float alsRaw = 0, uvsRaw = 0;
-
-// Timer durations in minutes
-const int ON_DURATION = 10;   // Duration the pump stays ON
-const int OFF_DURATION = 20;  // Duration the pump stays OFF
-
-// Variables to track timing
+// ——— Globals & objects ———
+Adafruit_AHTX0 aht;
+Adafruit_LTR390 ltr;
+DFRobot_ST7735_128x160_HW_SPI screen(TFT_DC, TFT_CS, TFT_RST);
 RTC_DS3231 rtc;
-DateTime lastToggleTime;
+
+WiFiClientSecure espClient;
+PubSubClient mqtt(espClient);
+
+// Shared sensor & pump state
+float temperature = 0, hum = 0, pHValue = 0, tdsValue = 0, ecValue = 0, water_temp = 0, alsLux = 0, uvIndex = 0;
 bool pumpState = false;  // false = OFF, true = ON
+DateTime lastToggleTime;
 
-const int DATA_COLLECT_INTERVAL = 60;
-DateTime dataLastCollectedTime;
-int lastSecond = -1;
+// For pH measurement
+unsigned long avgValue;
+int buf[10], tempBuf;
 
-// Duration for nutrient dosing (in seconds) – pumps run for 14 seconds.
+// For EC/TDS
+int ec_tds_buffer[10] = { 0 };
+
+// Timer durations (in minutes / seconds)
+const int ON_DURATION = 10;   // water pump ON minutes
+const int OFF_DURATION = 20;  // water pump OFF minutes
 const unsigned long NUTRIENT_DISPENSE_DURATION_SEC = 14;
-
-// Cooldown period after a dosing event (in seconds) – 5 minutes = 300 seconds.
 const unsigned long COOLDOWN_PERIOD_SEC = 300;
 
-// TDS thresholds (adjust as needed)
-const float TDS_LOW_LIMIT = 700.0;    // Below this, dosing is needed.
-const float TDS_HIGH_LIMIT = 1000.0;  // At or above this, dosing is not allowed.
+// TDS thresholds
+const float TDS_LOW_LIMIT = 700.0;
+const float TDS_HIGH_LIMIT = 1000.0;
 
-// Global variables for dosing control:
-bool nutrientDispenseInProgress = false;  // true if pumps are currently dosing
-bool nutrientDosingDone = false;          // true if a dosing event has completed (and cooldown is active)
+// Nutrient dosing state
+bool nutrientDispenseInProgress = false;
+bool nutrientDosingDone = false;
+DateTime nutrientDispenseStartTimeRtc;
+DateTime lastDosingEndTime;
 
-// RTC-based timestamp variables for dosing:
-DateTime nutrientDispenseStartTimeRtc;  // When the dosing (pump on) began.
-DateTime lastDosingEndTime;             // When the dosing event ended (used for cooldown)
-
-// Data sending
+// MQTT / WiFi
 DateTime lastDataSentTime;
-
 const char* mqtt_broker = "rff61f13.ala.asia-southeast1.emqxsl.com";
-const char* topic = "test/test";
-const char* command_topic = "devices/test/command";
-const char* mqtt_username = "test";
-const char* mqtt_password = "hydrobud12345";
 const int mqtt_port = 8883;
-const char* ca_cert = R"EOF(  
+const char* mqtt_user = "test";
+const char* mqtt_pass = "hydrobud12345";
+const char* mqtt_topic_data = "test/test";
+const char* mqtt_topic_cmd = "devices/test/command";
+const char* ca_cert = R"EOF(
 -----BEGIN CERTIFICATE-----
 MIIDrzCCApegAwIBAgIQCDvgVpBCRrGhdWrJWZHHSjANBgkqhkiG9w0BAQUFADBh
 MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
@@ -106,271 +96,374 @@ CAUw7C29C79Fv1C5qfPrmAESrciIxpg0X40KPMbp1ZWVbd4=
 -----END CERTIFICATE-----
 )EOF";
 
+// ——— Forward declarations ———
+void setupHardware();
+void setupWiFi();
+void reconnectMqtt();
+void handleMqttCallback(char* topic, uint8_t* payload, unsigned int length);
 
-WiFiClientSecure espClient;
-PubSubClient client(espClient);
+void sensorTask(void*);
+void displayTask(void*);
+void pumpTask(void*);
+void mqttTask(void*);
 
-std::pair<float, float> calculateECTDS(int pin, float aref, float dynamicTemp, int buffer[], int bufferSize) {
-  static unsigned long analogSampleTimepoint = millis();
-  static unsigned long printTimepoint = millis();
-  static int bufferIndex = 0;
-  float temperature = dynamicTemp;
-  float adcRange = 4096.0;  // 12-bit ADC range
-
-  // Analog reading logic
-  if (millis() - analogSampleTimepoint > 40U) {
-    analogSampleTimepoint = millis();
-    buffer[bufferIndex] = analogRead(pin);  // Read and store the analog value
-    bufferIndex++;
-    if (bufferIndex == bufferSize) {
-      bufferIndex = 0;
-    }
-  }
-
-  // Calculation logic
-  if (millis() - printTimepoint > 800U) {
-    printTimepoint = millis();
-
-    // Copy buffer for median calculation
-    int tempBuffer[bufferSize];
-    for (int i = 0; i < bufferSize; i++) {
-      tempBuffer[i] = buffer[i];
-    }
-
-    // Calculate average voltage using the median filtering algorithm
-    int medianValue = getMedianNum(tempBuffer, bufferSize);
-    float averageVoltage = (medianValue * aref) / adcRange;
-
-    // Temperature compensation
-    float compensationCoefficient = 1.0 + 0.02 * (temperature - 25.0);
-    // float compensationVoltage = averageVoltage / compensationCoefficient;
-    float compensationVoltage = averageVoltage;
-    // Serial.printf("Avg V: %.2f, Comp Coeff: %.2f, Comp V: %.2f", averageVoltage, compensationCoefficient, compensationVoltage);
-    // Serial.println();
-    if (temperature <= 0) {
-      compensationCoefficient = 1.0;  // Avoid unrealistic adjustments for negative temperatures
-    }
-
-    // EC calculation in µS/cm (microSiemens per centimeter)
-    float ecValue = compensationVoltage * 1000.0;  // Conversion factor for EC
-
-    // TDS calculation
-    float tdsValue = (133.42 * compensationVoltage * compensationVoltage * compensationVoltage - 255.86 * compensationVoltage * compensationVoltage + 857.39 * compensationVoltage) * 0.5;
-
-    // Return EC and TDS as a pair
-    return { ecValue, tdsValue };
-  }
-
-  // Return 0 for both EC and TDS if not ready to calculate
-  return { 0.0, 0.0 };
-}
-
-int getMedianNum(int bArray[], int iFilterLen) {
-  int bTab[iFilterLen];
-  for (int i = 0; i < iFilterLen; i++) {
-    bTab[i] = bArray[i];
-  }
-  for (int j = 0; j < iFilterLen - 1; j++) {
-    for (int i = 0; i < iFilterLen - j - 1; i++) {
-      if (bTab[i] > bTab[i + 1]) {
-        int bTemp = bTab[i];
-        bTab[i] = bTab[i + 1];
-        bTab[i + 1] = bTemp;
-      }
-    }
-  }
-  if (iFilterLen % 2 == 1) {
-    return bTab[iFilterLen / 2];
-  } else {
-    return (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
-  }
-}
+std::pair<float, float> calculateECTDS(int pin, float aref, float dynamicTemp, int buffer[], int bufferSize);
+int getMedianNum(int bArray[], int iFilterLen);
+float alsToLux(uint16_t alsRawValue);
+float uvsToUvIndex(uint16_t uvsRawValue);
+void sendData();
+void sendPumpData(const char* pumpType, bool status);
+void checkNutrientDispense();
+void setupDisplay();
 
 void setup() {
   Serial.begin(115200);
-  pinMode(led, OUTPUT);
-  pinMode(PHPIN, INPUT);
-
-
-  setupWifi();
+  Serial.println(">> setup() start");
+  setupHardware();
+  setupWiFi();
   espClient.setCACert(ca_cert);
-  client.setServer(mqtt_broker, mqtt_port);
-  client.setCallback(handleMqttCallback);
+  mqtt.setServer(mqtt_broker, mqtt_port);
+  mqtt.setCallback(handleMqttCallback);
 
-  // Initialize RTC
-  if (!rtc.begin()) {
-    Serial.println("Couldn't find RTC");
-    while (1)
-      ;
-  }
-  if (rtc.lostPower()) {
-    Serial.println("RTC lost power, setting the time!");
-    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));  // Set RTC to compile time
-  }
-
-  // Setup nutrient pump relay pins
-  pinMode(NUTRIENT_PUMP1_PIN, OUTPUT);
-  pinMode(NUTRIENT_PUMP2_PIN, OUTPUT);
-  pinMode(WATER_PUMP_BTN, INPUT);
-  pinMode(WATER_PUMP_PIN, OUTPUT);
-
-  digitalWrite(NUTRIENT_PUMP1_PIN, HIGH);
-  digitalWrite(NUTRIENT_PUMP2_PIN, HIGH);
-  digitalWrite(WATER_PUMP_PIN, LOW);
-
-  // Initialize variables
   lastToggleTime = rtc.now();
-  lastDataSentTime = rtc.now();
-  lastDosingEndTime = rtc.now();
-  nutrientDispenseStartTimeRtc = rtc.now();
-  dataLastCollectedTime = rtc.now();
 
-  if (!aht.begin()) {
-    Serial.println("Could not find AHT? Check wiring");
-    while (1) delay(10);
-  }
-  Serial.println("AHT10 or AHT20 found");
-  initializeLTRSensor();
+ xTaskCreatePinnedToCore(sensorTask,  "Sensor",  4096, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(displayTask, "Display", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(pumpTask,    "Pump",    4096, NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(mqttTask,    "MQTT",    8192, NULL, 1, NULL, 0);
 
-  setupDisplay();
-
-  reconnectMqtt();
+  // Terminate Arduino loop task
+  vTaskDelete(NULL);
 }
 
 void loop() {
-  digitalWrite(led, HIGH);
-
-  if (!client.connected()) reconnectMqtt();
-  client.loop();
-
-  DateTime now = rtc.now();
-  if (now.second() != lastSecond) {
-    lastSecond = now.second();
-    readSensors();
-    updateDisplayValues();
-    checkNutrientDispense();
-  }
-
-  if (now.unixtime() - lastDataSentTime.unixtime() >= 30) {
-    sendData();
-    lastDataSentTime = now;
-  }
-
-  waterPumpTimerControl();
-  digitalWrite(led, LOW);
+  // never runs; all logic is in tasks
 }
 
-void waterPumpTimerControl() {
-  static bool lastButtonState = HIGH;  // Previous state of the button
-  bool currentButtonState = digitalRead(WATER_PUMP_BTN);
+// ——— Hardware initialization ———
+void setupHardware() {
+  // Setup I2C with pull‑ups
+  Wire.begin(SDA_PIN, SCL_PIN);
+  pinMode(SDA_PIN, INPUT_PULLUP);
+  pinMode(SCL_PIN, INPUT_PULLUP);
 
-  // Detect button press (falling edge)
-  if (lastButtonState == HIGH && currentButtonState == LOW) {
-    pumpState = !pumpState;                                // Toggle pump state
-    digitalWrite(WATER_PUMP_PIN, pumpState ? HIGH : LOW);  // Control the pump
-    lastToggleTime = rtc.now();                            // Sync the timer with the button press
-  }
+  // RTC
+  if (!rtc.begin())
+    while (1)
+      ;
+  if (rtc.lostPower()) rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
 
-  lastButtonState = currentButtonState;
-
-  // Water Pump timer logic
-  DateTime currentTime = rtc.now();
-  long elapsedSeconds = currentTime.unixtime() - lastToggleTime.unixtime();  // Seconds elapsed
-
-  // Update pump state based on elapsed time
-  if (pumpState && elapsedSeconds >= ON_DURATION * 60) {
-    // Turn OFF the pump after ON_DURATION
-    digitalWrite(WATER_PUMP_PIN, LOW);  // Relay LOW = Pump OFF
-    pumpState = false;
-    lastToggleTime = currentTime;
-    sendPumpData("Water", false);
-    Serial.println("Pump OFF");
-  } else if (!pumpState && elapsedSeconds >= OFF_DURATION * 60) {
-    // Turn ON the pump after OFF_DURATION
-    sendPumpData("Water", true);
-    digitalWrite(WATER_PUMP_PIN, HIGH);  // Relay HIGH = Pump ON
-    pumpState = true;
-    lastToggleTime = currentTime;
-    Serial.println("Pump ON");
-  }
-}
-
-void readSensors() {
-  DateTime currentTime = rtc.now();
-  long elapsedSeconds = currentTime.unixtime() - dataLastCollectedTime.unixtime();  // Seconds elapsed
-
-  // if (elapsedSeconds >= DATA_COLLECT_INTERVAL) {
-  sensors_event_t humidity, temp;
-  aht.getEvent(&humidity, &temp);
-
-  for (int i = 0; i < 10; i++) {  // Get 10 sample values from the sensor for smoothing
-    buf[i] = analogRead(PHPIN);
-    delay(10);
-  }
-  for (int i = 0; i < 9; i++) {  // Sort the analog values from small to large
-    for (int j = i + 1; j < 10; j++) {
-      if (buf[i] > buf[j]) {
-        tempBuf = buf[i];
-        buf[i] = buf[j];
-        buf[j] = tempBuf;
-      }
+  // Sensors
+  if (!aht.begin())
+    while (1) {
+      Serial.println("AHT not found");
+      delay(500);
     }
-  }
-  avgValue = 0;
-  for (int i = 2; i < 8; i++) {  // Take the average value of 6 center samples
-    avgValue += buf[i];
-  }
-  pHValue = (((float)avgValue * 3.3) / 4095) - 1.51;
-
-
-  ltr.setMode(LTR390_MODE_ALS);
-  alsRaw = ltr.readALS();
-  delay(100);
-  ltr.setMode(LTR390_MODE_UVS);
-  uvsRaw = ltr.readUVS();
-
-  alsLux = alsToLux(alsRaw);
-  uvIndex = uvsToUvIndex(uvsRaw);
-
-  temperature = temp.temperature;
-  hum = humidity.relative_humidity;
-
-  // ds18b20_sensor.requestTemperatures();
-  // water_temp = ds18b20_sensor.getTempCByIndex(0);
-  // if (water_temp == DEVICE_DISCONNECTED_C) {
-  // Serial.println("Error: DS18B20 Disconnected!");
-  // water_temp = 0;
-  // }
-
-  auto [ec, tds] = calculateECTDS(TDSPIN, 5.0, temperature, ec_tds_buffer, 10);
-  tdsValue = tds;
-  ecValue = ec;
-
-  Serial.printf("Temperature: %.2f, Humidity: %.2f, ALS: %.1f, UVS: %.2f, ALSRaw: %.1f, UVSRaw: %.2f, PH: %.2f, TDS: %.2f, EC: %.2f, Water Temp: %.2f\n", temperature, hum, alsLux, uvIndex, alsRaw, uvsRaw, pHValue, tdsValue, ecValue, water_temp);
-  // }
-}
-
-void initializeLTRSensor() {
-  if (!ltr.begin()) {
-    Serial.println("Couldn't find LTR sensor!");
-    while (1) delay(10);
-  }
-  Serial.println("Found LTR sensor!");
+  if (!ltr.begin())
+    while (1) {
+      Serial.println("LTR not found");
+      delay(500);
+    }
   ltr.setGain(LTR390_GAIN_9);
   ltr.setResolution(LTR390_RESOLUTION_18BIT);
+
+  // Display
+  screen.begin();
+  screen.fillScreen(COLOR_RGB565_BLACK);
+  screen.setTextSize(1);
+  screen.setTextColor(COLOR_RGB565_WHITE);
+  setupDisplay();
+
+  // Pump pins
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(WATER_PUMP_PIN, OUTPUT);
+  pinMode(WATER_PUMP_BTN, INPUT_PULLUP);
+  pinMode(NUTRIENT_PUMP1_PIN, OUTPUT);
+  pinMode(NUTRIENT_PUMP2_PIN, OUTPUT);
+  digitalWrite(NUTRIENT_PUMP1_PIN, HIGH);
+  digitalWrite(NUTRIENT_PUMP2_PIN, HIGH);
+  digitalWrite(WATER_PUMP_PIN, LOW);
+}
+
+void setupWiFi() {
+  WiFi.begin("Airtel_vire_4844", "air53020");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.printf("\nWiFi connected: %s\n", WiFi.localIP().toString().c_str());
 }
 
 void reconnectMqtt() {
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    if (client.connect("ESP32Client", mqtt_username, mqtt_password)) {
+  while (!mqtt.connected()) {
+    Serial.print("MQTT connecting…");
+    if (mqtt.connect("ESP32Client", mqtt_user, mqtt_pass)) {
       Serial.println("connected");
-      client.subscribe(command_topic);
+      mqtt.subscribe(mqtt_topic_cmd);
     } else {
-      Serial.printf("failed, rc=%d\n", client.state());
-      delay(5000);
+      Serial.printf("failed, rc=%d\n", mqtt.state());
+      delay(2000);
     }
   }
+}
+
+// ——— MQTT callback ———
+void handleMqttCallback(char* topic, uint8_t* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, msg) != DeserializationError::Ok) return;
+  const char* command = doc["command"];
+  if (!command) return;
+
+  if (strcmp(command, "nutrient_on") == 0) {
+    digitalWrite(NUTRIENT_PUMP1_PIN, LOW);
+    digitalWrite(NUTRIENT_PUMP2_PIN, LOW);
+    nutrientDispenseInProgress = false;
+    nutrientDosingDone = false;
+    sendPumpData("Nutrient", true);
+  } else if (strcmp(command, "nutrient_off") == 0) {
+    digitalWrite(NUTRIENT_PUMP1_PIN, HIGH);
+    digitalWrite(NUTRIENT_PUMP2_PIN, HIGH);
+    nutrientDispenseInProgress = false;
+    nutrientDosingDone = true;
+    sendPumpData("Nutrient", false);
+  } else if (strcmp(command, "water_on") == 0) {
+    digitalWrite(WATER_PUMP_PIN, HIGH);
+    pumpState = true;
+    lastToggleTime = rtc.now();
+    sendPumpData("Water", true);
+  } else if (strcmp(command, "water_off") == 0) {
+    digitalWrite(WATER_PUMP_PIN, LOW);
+    pumpState = false;
+    lastToggleTime = rtc.now();
+    sendPumpData("Water", false);
+  } else if (strcmp(command, "emergency_off") == 0) {
+    digitalWrite(WATER_PUMP_PIN, LOW);
+    pumpState = false;
+    digitalWrite(NUTRIENT_PUMP1_PIN, HIGH);
+    digitalWrite(NUTRIENT_PUMP2_PIN, HIGH);
+    nutrientDispenseInProgress = false;
+    nutrientDosingDone = true;
+    lastToggleTime = rtc.now();
+    lastDosingEndTime = rtc.now();
+    sendPumpData("Water", false);
+    sendPumpData("Nutrient", false);
+  }
+}
+
+// ——— Tasks ———
+
+void sensorTask(void* pv) {
+  for (;;) {
+    sensors_event_t ev_h, ev_t;
+    aht.getEvent(&ev_h, &ev_t);
+    hum = ev_h.relative_humidity;
+    temperature = ev_t.temperature;
+
+    // pH smoothing
+    for (int i = 0; i < 10; i++) {
+      buf[i] = analogRead(PHPIN);
+      delay(10);
+    }
+    // sort
+    for (int i = 0; i < 9; i++) {
+      for (int j = i + 1; j < 10; j++) {
+        if (buf[i] > buf[j]) {
+          tempBuf = buf[i];
+          buf[i] = buf[j];
+          buf[j] = tempBuf;
+        }
+      }
+    }
+    avgValue = 0;
+    for (int i = 2; i < 8; i++) avgValue += buf[i];
+    pHValue = ((float)avgValue * 3.3 / 4095) - 1.51;
+
+    // LTR ALS + UVS
+    ltr.setMode(LTR390_MODE_ALS);
+    uint16_t rawAls = ltr.readALS();
+    delay(100);
+    ltr.setMode(LTR390_MODE_UVS);
+    uint16_t rawUvs = ltr.readUVS();
+    alsLux = alsToLux(rawAls);
+    uvIndex = uvsToUvIndex(rawUvs);
+
+    // EC/TDS
+    auto [ec, tds] = calculateECTDS(TDSPIN, 5.0, temperature, ec_tds_buffer, 10);
+    ecValue = ec;
+    tdsValue = tds;
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+void displayTask(void* pv) {
+  char bufStr[32];
+  for (;;) {
+    // digitalWrite(LED_PIN, HIGH);
+
+    // Temp
+    screen.fillRect(90, 20, 40, 8, COLOR_RGB565_BLACK);
+    screen.setCursor(90, 20);
+    snprintf(bufStr, sizeof(bufStr), "%.2f", temperature);
+    screen.print(bufStr);
+
+    // Humidity
+    screen.fillRect(90, 30, 40, 8, COLOR_RGB565_BLACK);
+    screen.setCursor(90, 30);
+    snprintf(bufStr, sizeof(bufStr), "%.2f", hum);
+    screen.print(bufStr);
+
+    // pH
+    screen.fillRect(90, 40, 40, 8, COLOR_RGB565_BLACK);
+    screen.setCursor(90, 40);
+    snprintf(bufStr, sizeof(bufStr), "%.2f", pHValue);
+    screen.print(bufStr);
+
+    // TDS
+    screen.fillRect(90, 50, 40, 8, COLOR_RGB565_BLACK);
+    screen.setCursor(90, 50);
+    snprintf(bufStr, sizeof(bufStr), "%.2f", tdsValue);
+    screen.print(bufStr);
+
+    // EC
+    screen.fillRect(90, 60, 40, 8, COLOR_RGB565_BLACK);
+    screen.setCursor(90, 60);
+    snprintf(bufStr, sizeof(bufStr), "%.2f", ecValue);
+    screen.print(bufStr);
+
+    // Water temp
+    screen.fillRect(90, 70, 40, 8, COLOR_RGB565_BLACK);
+    screen.setCursor(90, 70);
+    snprintf(bufStr, sizeof(bufStr), "%.2f", water_temp);
+    screen.print(bufStr);
+
+    // ALS
+    screen.fillRect(50, 80, 50, 8, COLOR_RGB565_BLACK);
+    screen.setCursor(50, 80);
+    snprintf(bufStr, sizeof(bufStr), "%.1f", alsLux);
+    screen.print(bufStr);
+
+    // UVS
+    screen.fillRect(50, 90, 50, 8, COLOR_RGB565_BLACK);
+    screen.setCursor(50, 90);
+    snprintf(bufStr, sizeof(bufStr), "%.2f", uvIndex);
+    screen.print(bufStr);
+
+    // Pump state
+    screen.fillRect(50, 100, 50, 8, COLOR_RGB565_BLACK);
+    screen.setCursor(50, 100);
+    screen.print(pumpState ? "ON" : "OFF");
+
+    // Elapsed
+    auto now = rtc.now();
+    int secs = now.unixtime() - lastToggleTime.unixtime();
+    screen.fillRect(60, 110, 60, 8, COLOR_RGB565_BLACK);
+    screen.setCursor(60, 110);
+    snprintf(bufStr, sizeof(bufStr), "%02d:%02d", secs / 60, secs % 60);
+    screen.print(bufStr);
+
+    // digitalWrite(LED_PIN, LOW);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+void pumpTask(void* pv) {
+  const int ON_SEC = ON_DURATION * 60;
+  const int OFF_SEC = OFF_DURATION * 60;
+  for (;;) {
+    // Button toggle
+    static bool lastBtnState = HIGH;
+    bool btn = digitalRead(WATER_PUMP_BTN);
+    if (lastBtnState == HIGH && btn == LOW) {
+      pumpState = !pumpState;
+      digitalWrite(WATER_PUMP_PIN, pumpState ? HIGH : LOW);
+      lastToggleTime = rtc.now();
+      sendPumpData("Water", pumpState);
+    }
+    lastBtnState = btn;
+
+    // Scheduled water control
+    int elapsed = rtc.now().unixtime() - lastToggleTime.unixtime();
+    if (pumpState && elapsed >= ON_SEC) {
+      digitalWrite(WATER_PUMP_PIN, LOW);
+      pumpState = false;
+      lastToggleTime = rtc.now();
+      sendPumpData("Water", false);
+    } else if (!pumpState && elapsed >= OFF_SEC) {
+      digitalWrite(WATER_PUMP_PIN, HIGH);
+      pumpState = true;
+      lastToggleTime = rtc.now();
+      sendPumpData("Water", true);
+    }
+
+    // Nutrient dosing
+    checkNutrientDispense();
+
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+}
+
+void mqttTask(void* pv) {
+  const TickType_t interval = pdMS_TO_TICKS(30000);
+  TickType_t lastWake = xTaskGetTickCount();
+  for (;;) {
+    if (!mqtt.connected()) reconnectMqtt();
+    mqtt.loop();
+
+    if (xTaskGetTickCount() - lastWake >= interval) {
+      sendData();
+      lastWake = xTaskGetTickCount();
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// ——— Helper functions ———
+
+std::pair<float, float> calculateECTDS(int pin, float aref, float dynamicTemp, int buffer[], int bufferSize) {
+  static unsigned long sampleTime = millis();
+  static unsigned long printTime = millis();
+  static int bufIndex = 0;
+
+  if (millis() - sampleTime > 40U) {
+    sampleTime = millis();
+    buffer[bufIndex++] = analogRead(pin);
+    if (bufIndex == bufferSize) bufIndex = 0;
+  }
+  if (millis() - printTime > 800U) {
+    printTime = millis();
+    int tempBuf2[bufferSize];
+    memcpy(tempBuf2, buffer, sizeof(tempBuf2));
+    int median = getMedianNum(tempBuf2, bufferSize);
+    float voltage = (median * aref) / 4096.0;
+    float ec = voltage * 1000.0;
+    float tds = (133.42 * pow(voltage, 3) - 255.86 * pow(voltage, 2) + 857.39 * voltage) * 0.5;
+    return { ec, tds };
+  }
+  return { 0.0, 0.0 };
+}
+
+int getMedianNum(int bArray[], int len) {
+  int bTab[len];
+  memcpy(bTab, bArray, sizeof(bTab));
+  for (int i = 0; i < len - 1; i++)
+    for (int j = 0; j < len - i - 1; j++)
+      if (bTab[j] > bTab[j + 1]) {
+        int t = bTab[j];
+        bTab[j] = bTab[j + 1];
+        bTab[j + 1] = t;
+      }
+  if (len % 2) return bTab[len / 2];
+  return (bTab[len / 2] + bTab[len / 2 - 1]) / 2;
+}
+
+float alsToLux(uint16_t v) {
+  return v * 0.6;
+}
+float uvsToUvIndex(uint16_t v) {
+  return v * 0.001461;
 }
 
 void sendData() {
@@ -384,14 +477,13 @@ void sendData() {
   doc["TDS"] = tdsValue;
   doc["EC"] = ecValue;
   doc["ALS"] = alsLux;
-  doc["ALSraw"] = alsRaw;
+  doc["ALSraw"] = (int)ltr.readALS();
   doc["UVS"] = uvIndex;
-  doc["UVSraw"] = uvsRaw;
+  doc["UVSraw"] = (int)ltr.readUVS();
   doc["waterTemp"] = water_temp;
-
-  char jsonBuffer[256];
-  serializeJson(doc, jsonBuffer);
-  client.publish(topic, jsonBuffer);
+  char bufJson[256];
+  serializeJson(doc, bufJson);
+  mqtt.publish(mqtt_topic_data, bufJson);
 }
 
 void sendPumpData(const char* pumpType, bool status) {
@@ -399,295 +491,68 @@ void sendPumpData(const char* pumpType, bool status) {
   doc["userEmail"] = "vsk102002@gmail.com";
   doc["deviceId"] = "test";
   doc["type"] = "pump-log";
-  doc["status"] = status;
   doc["pumpType"] = pumpType;
-
-  char jsonBuffer[256];
-  serializeJson(doc, jsonBuffer);
-  client.publish(topic, jsonBuffer);
-}
-
-
-void setupWifi() {
-  WiFi.begin("Airtel_vire_4844", "air53020");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.printf("\nWiFi connected. IP: %s\n", WiFi.localIP().toString().c_str());
-}
-
-void handleMqttCallback(char* topic, byte* message, unsigned int length) {
-  // Convert the incoming message to a String for easy parsing.
-  String msg;
-  for (unsigned int i = 0; i < length; i++) {
-    msg += (char)message[i];
-  }
-  Serial.printf("Message arrived on topic %s: %s\n", topic, msg.c_str());
-
-  // Parse the JSON message.
-  StaticJsonDocument<256> doc;
-  DeserializationError error = deserializeJson(doc, msg);
-  if (error) {
-    Serial.println("Failed to parse JSON command");
-    return;
-  }
-
-  // Read the command from the JSON. (Assuming the key is "command")
-  const char* command = doc["command"];
-  if (command == nullptr) {
-    Serial.println("No command received");
-    return;
-  }
-
-  // Process the command.
-  if (strcmp(command, "nutrient_on") == 0) {
-    // Turn ON nutrient pumps.
-    digitalWrite(NUTRIENT_PUMP1_PIN, LOW);  // LOW turns pump ON
-    digitalWrite(NUTRIENT_PUMP2_PIN, LOW);
-    nutrientDispenseInProgress = false;  // Reset any dosing state.
-    nutrientDosingDone = false;
-    sendPumpData("Nutrient", true);
-    Serial.println("Command: Nutrient Pumps ON");
-  }
-  if (strcmp(command, "nutrient_off") == 0) {
-    // Turn OFF nutrient pumps.
-    digitalWrite(NUTRIENT_PUMP1_PIN, HIGH);  // HIGH turns pump OFF
-    digitalWrite(NUTRIENT_PUMP2_PIN, HIGH);
-    nutrientDispenseInProgress = false;
-    nutrientDosingDone = true;
-    sendPumpData("Nutrient", false);
-    Serial.println("Command: Nutrient Pumps OFF");
-  }
-  if (strcmp(command, "water_on") == 0) {
-    // Turn ON water pump.
-    digitalWrite(WATER_PUMP_PIN, HIGH);  // HIGH turns water pump ON
-    pumpState = true;
-    lastToggleTime = rtc.now();
-    sendPumpData("Water", true);
-    Serial.println("Command: Water Pump ON");
-  }
-  if (strcmp(command, "water_off") == 0) {
-    // Turn OFF water pump.
-    digitalWrite(WATER_PUMP_PIN, LOW);  // LOW turns water pump OFF
-    pumpState = false;
-    lastToggleTime = rtc.now();
-    sendPumpData("Water", false);
-    Serial.println("Command: Water Pump OFF");
-  }
-  if (strcmp(command, "emergency_off") == 0) {
-    // Master failsafe: Turn OFF both nutrient and water pumps.
-    digitalWrite(WATER_PUMP_PIN, LOW);  // Shut off water pump.
-    pumpState = false;
-    digitalWrite(NUTRIENT_PUMP1_PIN, HIGH);  // Shut off nutrient pumps.
-    digitalWrite(NUTRIENT_PUMP2_PIN, HIGH);
-    nutrientDispenseInProgress = false;
-    nutrientDosingDone = true;
-    lastToggleTime = rtc.now();
-    lastDosingEndTime = rtc.now();
-    sendPumpData("Water", false);
-    sendPumpData("Nutrient", false);
-    Serial.println("Command: Emergency OFF - All pumps shut down");
-  }
-  // if (strcmp(command, "request_status") == 0) {
-  //   // Build a status response containing both pump statuses.
-  //   StaticJsonDocument<256> statusDoc;
-  //   statusDoc["userEmail"] = "vsk102002@gmail.com";
-  //   statusDoc["deviceId"] = "test";
-  //   statusDoc["type"] = "status-response";
-  //   // Water pump status: use the pumpState variable.
-  //   statusDoc["waterPumpStatus"] = pumpState;
-  //   // Nutrient pump status: use the global nutrientPumpState variable.
-  //   statusDoc["nutrientPumpStatus"] = nutrientDispenseInProgress;
-
-  //   char statusBuffer[256];
-  //   serializeJson(statusDoc, statusBuffer);
-  //   client.publish(topic, statusBuffer);
-  //   Serial.println("Command: Status requested. Status response sent.");
-  // }
-}
-
-
-void setupDisplay() {
-  screen.begin();
-  screen.fillScreen(COLOR_RGB565_BLACK);
-  screen.setTextSize(1);
-  screen.setTextColor(COLOR_RGB565_WHITE);
-
-  // Draw static labels once:
-  screen.setCursor(10, 10);
-  screen.print("Sensor Readings:");
-
-  screen.setCursor(10, 20);
-  screen.print("Temperature:");
-
-  screen.setCursor(10, 30);
-  screen.print("Humidity:");
-
-  screen.setCursor(10, 40);
-  screen.print("pH:");
-
-  screen.setCursor(10, 50);
-  screen.print("TDS:");
-
-  screen.setCursor(10, 60);
-  screen.print("EC:");
-
-  screen.setCursor(10, 70);
-  screen.print("Water Temp:");
-
-  screen.setCursor(10, 80);
-  screen.print("ALS:");  // Ambient Light Sensor (lux)
-
-  screen.setCursor(10, 90);
-  screen.print("UVS:");  // UV Sensor (UV index)
-
-  // Moved pump status and elapsed time down:
-  screen.setCursor(10, 100);
-  screen.print("Pump:");
-
-  screen.setCursor(10, 110);
-  screen.print("Elapsed:");
-}
-
-void updateDisplayValues() {
-  char buffer[30];
-
-  // For each dynamic value, clear the old number and print the new one.
-  // Adjust the coordinates and size of the cleared rectangle as needed.
-
-  // Temperature value (clearing area where value appears)
-  screen.fillRect(90, 20, 40, 8, COLOR_RGB565_BLACK);  // clear area
-  screen.setCursor(90, 20);
-  snprintf(buffer, sizeof(buffer), "%.2f", temperature);
-  screen.print(buffer);
-
-  // Humidity value
-  screen.fillRect(90, 30, 40, 8, COLOR_RGB565_BLACK);
-  screen.setCursor(90, 30);
-  snprintf(buffer, sizeof(buffer), "%.2f", hum);
-  screen.print(buffer);
-
-  // pH value
-  screen.fillRect(90, 40, 40, 8, COLOR_RGB565_BLACK);
-  screen.setCursor(90, 40);
-  snprintf(buffer, sizeof(buffer), "%.2f", pHValue);
-  screen.print(buffer);
-
-  // TDS value
-  screen.fillRect(90, 50, 40, 8, COLOR_RGB565_BLACK);
-  screen.setCursor(90, 50);
-  snprintf(buffer, sizeof(buffer), "%.2f", tdsValue);
-  screen.print(buffer);
-
-  // EC value
-  screen.fillRect(90, 60, 40, 8, COLOR_RGB565_BLACK);
-  screen.setCursor(90, 60);
-  snprintf(buffer, sizeof(buffer), "%.2f", ecValue);
-  screen.print(buffer);
-
-  // Water temperature value
-  screen.fillRect(90, 70, 40, 8, COLOR_RGB565_BLACK);
-  screen.setCursor(90, 70);
-  snprintf(buffer, sizeof(buffer), "%.2f", water_temp);
-  screen.print(buffer);
-
-  // ALS (lux) value on line 80
-  screen.fillRect(50, 80, 50, 8, COLOR_RGB565_BLACK);  // Adjust x position and width as needed
-  screen.setCursor(50, 80);
-  snprintf(buffer, sizeof(buffer), "%.1f", alsLux);
-  screen.print(buffer);
-
-  // UVS (UV index) value on line 90
-  screen.fillRect(50, 90, 50, 8, COLOR_RGB565_BLACK);  // Adjust x position and width as needed
-  screen.setCursor(50, 90);
-  snprintf(buffer, sizeof(buffer), "%.2f", uvIndex);
-  screen.print(buffer);
-
-  // Update Pump Status on line 100
-  screen.fillRect(50, 100, 50, 8, COLOR_RGB565_BLACK);  // Clear previous pump status area
-  screen.setCursor(50, 100);
-  screen.print(pumpState ? "ON" : "OFF");
-
-  // Update Elapsed Time on line 110
-  DateTime now = rtc.now();
-  long elapsedSeconds = now.unixtime() - lastToggleTime.unixtime();
-  int minutes = elapsedSeconds / 60;
-  int seconds = elapsedSeconds % 60;
-  screen.fillRect(60, 110, 60, 8, COLOR_RGB565_BLACK);  // Clear the previous elapsed time area
-  screen.setCursor(60, 110);
-  snprintf(buffer, sizeof(buffer), "%02d:%02d", minutes, seconds);
-  screen.print(buffer);
+  doc["status"] = status;
+  char bufJson[256];
+  serializeJson(doc, bufJson);
+  mqtt.publish(mqtt_topic_data, bufJson);
 }
 
 void checkNutrientDispense() {
   DateTime now = rtc.now();
-  if (tdsValue < TDS_LOW_LIMIT - 200) {
-    return;
-  }
-
-  // 1. If TDS is at or above the high limit:
   if (tdsValue >= TDS_HIGH_LIMIT) {
-    // If dosing is currently in progress, stop it.
     if (nutrientDispenseInProgress) {
       digitalWrite(NUTRIENT_PUMP1_PIN, HIGH);
       digitalWrite(NUTRIENT_PUMP2_PIN, HIGH);
       nutrientDispenseInProgress = false;
-      lastDosingEndTime = now;  // record when dosing stopped
+      lastDosingEndTime = now;
       sendPumpData("Nutrient", false);
-      Serial.println("TDS reached high limit. Stopping dosing.");
     }
-    // Set the dosing lock so that dosing will not start.
     nutrientDosingDone = true;
     return;
   }
-
-  // 2. Enforce the cooldown period (if a dosing event has just finished).
-  if (nutrientDosingDone) {
-    // If last dosing end time is valid and the cooldown has not yet expired:
-    if (lastDosingEndTime.unixtime() > 0 && (now.unixtime() - lastDosingEndTime.unixtime()) < COOLDOWN_PERIOD_SEC) {
-      // Still in cooldown—do nothing.
-      return;
-    } else {
-      // Cooldown period has passed; clear the dosing lock.
-      nutrientDosingDone = false;
-    }
+  if (nutrientDosingDone && (now.unixtime() - lastDosingEndTime.unixtime()) < COOLDOWN_PERIOD_SEC) {
+    return;
   }
-
-  // 3. If TDS is below the low limit and dosing is not in progress, start dosing.
+  nutrientDosingDone = false;
   if (tdsValue < TDS_LOW_LIMIT && !nutrientDispenseInProgress) {
-    // Start both nutrient pumps.
     digitalWrite(NUTRIENT_PUMP1_PIN, LOW);
     digitalWrite(NUTRIENT_PUMP2_PIN, LOW);
-    nutrientDispenseStartTimeRtc = now;  // record the start time via the RTC
+    nutrientDispenseStartTimeRtc = now;
     nutrientDispenseInProgress = true;
     sendPumpData("Nutrient", true);
-    Serial.println("Starting nutrient dosing...");
   }
-
-  // 4. If dosing is in progress, check if the dosing duration (14 seconds) has elapsed.
-  if (nutrientDispenseInProgress) {
-    long elapsedSec = now.unixtime() - nutrientDispenseStartTimeRtc.unixtime();
-    if (elapsedSec >= NUTRIENT_DISPENSE_DURATION_SEC) {
-      // Stop both pumps.
-      digitalWrite(NUTRIENT_PUMP1_PIN, HIGH);
-      digitalWrite(NUTRIENT_PUMP2_PIN, HIGH);
-      nutrientDispenseInProgress = false;
-      nutrientDosingDone = true;  // Set the dosing lock.
-      lastDosingEndTime = now;    // Record the end time.
-      sendPumpData("Nutrient", false);
-      Serial.println("Nutrient dosing complete.");
-    }
+  if (nutrientDispenseInProgress && (now.unixtime() - nutrientDispenseStartTimeRtc.unixtime()) >= NUTRIENT_DISPENSE_DURATION_SEC) {
+    digitalWrite(NUTRIENT_PUMP1_PIN, HIGH);
+    digitalWrite(NUTRIENT_PUMP2_PIN, HIGH);
+    nutrientDispenseInProgress = false;
+    nutrientDosingDone = true;
+    lastDosingEndTime = now;
+    sendPumpData("Nutrient", false);
   }
 }
 
-float alsToLux(uint16_t alsRawValue) {
-  // Example: When using a gain of 9 and 18-bit resolution, one possible conversion:
-  float conversionFactor = 0.6;  // (lux per raw count) -- adjust as needed.
-  return alsRawValue * conversionFactor;
-}
-
-float uvsToUvIndex(uint16_t uvsRawValue) {
-  float conversionFactor = 0.001461;  // (UV index per raw count) -- adjust as needed.
-  return uvsRawValue * conversionFactor;
+void setupDisplay() {
+  screen.setCursor(10, 10);
+  screen.print("Sensor Readings:");
+  screen.setCursor(10, 20);
+  screen.print("Temperature:");
+  screen.setCursor(10, 30);
+  screen.print("Humidity:");
+  screen.setCursor(10, 40);
+  screen.print("pH:");
+  screen.setCursor(10, 50);
+  screen.print("TDS:");
+  screen.setCursor(10, 60);
+  screen.print("EC:");
+  screen.setCursor(10, 70);
+  screen.print("Water Temp:");
+  screen.setCursor(10, 80);
+  screen.print("ALS:");
+  screen.setCursor(10, 90);
+  screen.print("UVS:");
+  screen.setCursor(10, 100);
+  screen.print("Pump:");
+  screen.setCursor(10, 110);
+  screen.print("Elapsed:");
 }
